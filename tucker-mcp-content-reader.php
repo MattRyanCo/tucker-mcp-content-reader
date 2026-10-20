@@ -3,7 +3,7 @@
  * Plugin Name: Tucker MCP Car Content Manager
  * Description: This contains core functionality for tuckerclug.org. It should remain activated.
  * Plugin URI: https://github.com/mattryanco/tucker-mcp-car-manager
- * Version: 2.0.1
+ * Version: 2.1.0
  * Author: Matt Ryan | WDS | Claude
  * Author URI: https://mattryan.co
  * GitHub Plugin URI: https://github.com/mattryanco/tucker-mcp-car-manager
@@ -1554,6 +1554,273 @@ function tuc_import_live_cars_execute( $input ) {
         'dry_run'     => $dry_run,
         'total_cars'  => count( $all ),
         'next_offset' => $next_offset,
+        'results'     => $results,
+    );
+}
+
+/* ------------------------------------------------------------------------
+ * tuc/attach-car-media
+ * Attaches the Media Library images in each car's attachment_category term
+ * (e.g. 1001) to the matching car post (tucker-1001) by setting post_parent.
+ * --------------------------------------------------------------------- */
+
+add_action( 'wp_abilities_api_init', 'tuc_register_attach_car_media_ability' );
+
+function tuc_register_attach_car_media_ability() {
+    wp_register_ability(
+        'tuc/attach-car-media',
+        array(
+            'category'    => 'tuc',
+            'label'       => 'Attach Car Media',
+            'description' => 'For each car post, finds the Media Library images in the matching attachment_category term (car tucker-1001 => category 1001) and attaches them to the car by setting each image\'s "Uploaded to" parent. Images already attached to a different post are flagged and left alone unless reassign is true. Pass names (slugs), or omit names and use offset/limit to page through all car posts in title order. Defaults to dry_run, which lists what would be attached without saving.',
+            'input_schema' => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'names' => array(
+                        'type'        => 'array',
+                        'items'       => array( 'type' => 'string' ),
+                        'description' => 'Car post slugs to process, e.g. ["tucker-1001","tucker-1002"].',
+                    ),
+                    'offset' => array(
+                        'type'        => 'integer',
+                        'description' => 'When names is omitted: number of car posts (sorted by title) to skip.',
+                        'default'     => 0,
+                    ),
+                    'limit' => array(
+                        'type'        => 'integer',
+                        'description' => 'When names is omitted: number of car posts to process (max 100).',
+                        'default'     => 100,
+                    ),
+                    'categories' => array(
+                        'type'                 => 'object',
+                        'description'          => 'Optional map of car slug => attachment_category slug, for cars whose category does not follow the default naming.',
+                        'additionalProperties' => array( 'type' => 'string' ),
+                    ),
+                    'reassign' => array(
+                        'type'        => 'boolean',
+                        'description' => 'If true, also re-attach images currently attached to a different post. Default false: those are flagged and left alone.',
+                        'default'     => false,
+                    ),
+                    'dry_run' => array(
+                        'type'        => 'boolean',
+                        'description' => 'If true, report what would be attached without saving.',
+                        'default'     => true,
+                    ),
+                ),
+            ),
+            'output_schema' => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'dry_run'     => array( 'type' => 'boolean' ),
+                    'reassign'    => array( 'type' => 'boolean' ),
+                    'total_cars'  => array( 'type' => 'integer' ),
+                    'next_offset' => array( 'type' => array( 'integer', 'null' ) ),
+                    'totals'      => array( 'type' => 'object', 'additionalProperties' => true ),
+                    'results'     => array( 'type' => 'array', 'items' => array( 'type' => 'object' ) ),
+                ),
+            ),
+            'permission_callback' => function () {
+                return current_user_can( 'edit_posts' );
+            },
+            'execute_callback'    => 'tuc_attach_car_media_execute',
+            'meta' => array(
+                'annotations' => array(
+                    'readonly'    => false,
+                    'destructive' => false,
+                    'idempotent'  => true,
+                ),
+                'mcp' => array(
+                    'public' => true,
+                ),
+            ),
+        )
+    );
+}
+
+/**
+ * Finds the attachment_category term for a car post: an explicit override, else the slug without
+ * its "tucker-" prefix (tucker-1001 => 1001), the full slug, or the slug without a trailing
+ * number (tin-goose-1000 => tin-goose).
+ */
+function tuc_get_car_media_term( $post, $override = '' ) {
+    $candidates = $override
+        ? array( sanitize_title( $override ) )
+        : array_unique(
+            array(
+                preg_replace( '/^tucker-/', '', $post->post_name ),
+                $post->post_name,
+                preg_replace( '/-\d+$/', '', $post->post_name ),
+            )
+        );
+
+    foreach ( $candidates as $slug ) {
+        $term = get_term_by( 'slug', $slug, 'attachment_category' );
+        if ( $term ) {
+            return $term;
+        }
+    }
+
+    return null;
+}
+
+function tuc_attach_car_media_execute( $input ) {
+    global $wpdb;
+
+    $input      = is_array( $input ) ? $input : array();
+    $dry_run    = array_key_exists( 'dry_run', $input ) ? (bool) $input['dry_run'] : true;
+    $reassign   = ! empty( $input['reassign'] );
+    $categories = isset( $input['categories'] ) ? (array) $input['categories'] : array();
+
+    if ( ! taxonomy_exists( 'attachment_category' ) ) {
+        return new WP_Error( 'tuc_no_taxonomy', 'The attachment_category taxonomy is not registered (is Media Library Assistant active?).' );
+    }
+
+    $all = get_posts(
+        array(
+            'post_type'      => 'car',
+            'post_status'    => array( 'publish', 'draft', 'pending', 'private', 'future' ),
+            'posts_per_page' => -1,
+            'orderby'        => 'title',
+            'order'          => 'ASC',
+            'fields'         => 'ids',
+        )
+    );
+
+    $next_offset = null;
+    if ( ! empty( $input['names'] ) ) {
+        $names = array_map( 'sanitize_title', (array) $input['names'] );
+    } else {
+        $offset = isset( $input['offset'] ) ? max( 0, intval( $input['offset'] ) ) : 0;
+        $limit  = isset( $input['limit'] ) ? min( 100, max( 1, intval( $input['limit'] ) ) ) : 100;
+        $ids    = array_slice( $all, $offset, $limit );
+        $names  = array_map(
+            function ( $id ) {
+                return get_post_field( 'post_name', $id );
+            },
+            $ids
+        );
+        $next_offset = ( $offset + $limit < count( $all ) ) ? $offset + $limit : null;
+    }
+
+    $totals  = array( 'attached' => 0, 'reassigned' => 0, 'already_attached' => 0, 'skipped' => 0 );
+    $claimed = array(); // Attachment ID => car slug it was attached to earlier in this run.
+    $results = array();
+
+    foreach ( $names as $name ) {
+        $post = tuc_get_car_post( array( 'name' => $name ) );
+        if ( ! $post ) {
+            $results[] = array( 'name' => $name, 'error' => 'No car post found.' );
+            continue;
+        }
+        if ( ! current_user_can( 'edit_post', $post->ID ) ) {
+            $results[] = array( 'name' => $name, 'post_id' => $post->ID, 'error' => 'You cannot edit this car post.' );
+            continue;
+        }
+
+        $term = tuc_get_car_media_term( $post, isset( $categories[ $name ] ) ? $categories[ $name ] : '' );
+        if ( ! $term ) {
+            $results[] = array( 'name' => $name, 'post_id' => $post->ID, 'error' => 'No matching attachment_category term found.' );
+            continue;
+        }
+
+        $images = get_posts(
+            array(
+                'post_type'      => 'attachment',
+                'post_status'    => 'inherit',
+                'post_mime_type' => 'image',
+                'posts_per_page' => -1,
+                'orderby'        => 'ID',
+                'order'          => 'ASC',
+                'tax_query'      => array(
+                    array(
+                        'taxonomy' => 'attachment_category',
+                        'field'    => 'term_id',
+                        'terms'    => $term->term_id,
+                    ),
+                ),
+            )
+        );
+
+        $result = array(
+            'name'             => $name,
+            'post_id'          => $post->ID,
+            'category'         => $term->slug,
+            'images'           => count( $images ),
+            'attach'           => array(),
+            'reassign'         => array(),
+            'already_attached' => 0,
+            'skipped'          => array(),
+        );
+
+        foreach ( $images as $image ) {
+            $item = array( 'id' => $image->ID, 'title' => $image->post_title );
+
+            if ( (int) $image->post_parent === $post->ID ) {
+                $result['already_attached']++;
+                continue;
+            }
+
+            // Image is in two car categories and was already attached to the other car in this run.
+            if ( isset( $claimed[ $image->ID ] ) ) {
+                $item['reason']      = 'Also in another car category; attached to ' . $claimed[ $image->ID ] . ' in this run.';
+                $result['skipped'][] = $item;
+                continue;
+            }
+
+            $parent = $image->post_parent ? get_post( $image->post_parent ) : null;
+            if ( $parent ) {
+                $item['current_parent'] = array(
+                    'id'    => $parent->ID,
+                    'title' => $parent->post_title,
+                    'type'  => $parent->post_type,
+                );
+                if ( ! $reassign ) {
+                    $item['reason']      = 'Attached to a different post.';
+                    $result['skipped'][] = $item;
+                    continue;
+                }
+                $bucket = 'reassign';
+            } else {
+                // Unattached, or its parent post no longer exists.
+                $bucket = 'attach';
+            }
+
+            if ( ! current_user_can( 'edit_post', $image->ID ) ) {
+                $item['reason']      = 'You cannot edit this attachment.';
+                $result['skipped'][] = $item;
+                continue;
+            }
+
+            if ( ! $dry_run ) {
+                // Same approach as core's Media Library "Attach" action.
+                $updated = $wpdb->update( $wpdb->posts, array( 'post_parent' => $post->ID ), array( 'ID' => $image->ID ) );
+                if ( false === $updated ) {
+                    $item['reason']      = 'Database update failed.';
+                    $result['skipped'][] = $item;
+                    continue;
+                }
+                clean_attachment_cache( $image->ID );
+                do_action( 'wp_media_attach_action', 'attach', $image->ID, $post->ID );
+            }
+
+            $claimed[ $image->ID ] = $name;
+            $result[ $bucket ][]   = $item;
+        }
+
+        $totals['attached']         += count( $result['attach'] );
+        $totals['reassigned']       += count( $result['reassign'] );
+        $totals['already_attached'] += $result['already_attached'];
+        $totals['skipped']          += count( $result['skipped'] );
+
+        $results[] = $result;
+    }
+
+    return array(
+        'dry_run'     => $dry_run,
+        'reassign'    => $reassign,
+        'total_cars'  => count( $all ),
+        'next_offset' => $next_offset,
+        'totals'      => $totals,
         'results'     => $results,
     );
 }
