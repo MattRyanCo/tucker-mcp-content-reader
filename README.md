@@ -1,4 +1,4 @@
-# tucker MCP Content Reader
+# Tucker MCP Content Reader
 === Tucker MCP Content Reader ===
 Contributors: rynonet
 Tags: functionality
