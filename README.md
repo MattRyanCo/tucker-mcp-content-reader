@@ -12,7 +12,8 @@ This plugin contains customized MCP abilities functionality logic for tuckerclub
 
 == Description ==
 
-This is the long description.  No limit, and you can use Markdown (as well as in the following sections).
+This plugin began as a proof of concept build based on a [blog post on Web Dev Studios website](https://webdevstudios.com/2026/10/15/wordpress-mcp-adapter-production/). It grew into a full implementation of an MCP abilities interface to manage the import and management of the car custom post type for the TuckerClub.org website. 
+
 
 == Installation ==
 

@@ -3,7 +3,7 @@
  * Plugin Name: Tucker MCP Car Content Manager
  * Description: This contains core functionality for tuckerclug.org. It should remain activated.
  * Plugin URI: https://github.com/mattryanco/tucker-mcp-car-manager
- * Version: 2.0.0
+ * Version: 2.0.1
  * Author: Matt Ryan | WDS | Claude
  * Author URI: https://mattryan.co
  * GitHub Plugin URI: https://github.com/mattryanco/tucker-mcp-car-manager
